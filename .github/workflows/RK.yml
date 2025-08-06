@@ -1,0 +1,158 @@
+name: Continuous Persistent VPS RK
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Just under 6 hours
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set hostname to Lilaine
+        run: sudo hostnamectl set-hostname Lilaine
+
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch docker.io
+
+      - name: Install Tailscale official script
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Install frp
+        run: |
+          wget https://github.com/fatedier/frp/releases/download/v0.63.0/frp_0.63.0_linux_amd64.tar.gz
+          tar -xvf frp_0.63.0_linux_amd64.tar.gz
+          sudo mv frp_0.63.0_linux_amd64/frp{s,c} /usr/local/bin
+          sudo chmod +x /usr/local/bin/frpc
+          sudo chmod +x /usr/local/bin/frps
+          rm -rf frp_0.63.0_linux_amd64
+          rm frp_0.63.0_linux_amd64.tar.gz
+
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+            # Восстанавливаем пользовательские настройки
+            sudo cp /opt/vps-backup/data/Lilaine /etc/sudoers.d/Lilaine
+            # Восстанавливаем frpc.toml
+            sudo cp /opt/vps-backup/data/frpc.toml /home/Lilaine/frpc.toml
+            # Восстанавливаем frpc.service
+            sudo cp /opt/vps-backup/data/frpc.service /etc/systemd/system/frpc.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now frpc
+            # Восстанавливаем список пакетов
+            sudo dpkg --set-selections < /opt/vps-backup/data/packages.list
+            sudo apt-get dselect-upgrade
+            # Восстанавливаем Docker volumes Nextcloud AIO
+            for volume in nextcloud_aio_mastercontainer nextcloud_aio_database nextcloud_aio_nextcloud nextcloud_aio_redis nextcloud_aio_collabora nextcloud_aio_talk; do
+              if [ -f /opt/vps-backup/$volume.tar ]; then
+                sudo docker run --rm -v $volume:/data -v /opt/vps-backup:/backup busybox tar xvf /backup/$volume.tar -C /data
+              fi
+            done
+          else
+            echo "No backup found, starting fresh"
+          fi
+
+      - name: Restore Tailscale state
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=Lilaine || echo "Tailscale already up"
+
+      - name: Create user Lilaine with sudo
+        run: |
+          if ! id -u Lilaine >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash Lilaine
+            echo "Lilaine:Lilaine" | sudo chpasswd
+            sudo usermod -aG sudo Lilaine
+            echo "Lilaine ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/Lilaine
+          fi
+
+      - name: Start Nextcloud AIO
+        run: |
+          sudo docker run \
+            --init \
+            --sig-proxy=false \
+            --name nextcloud-aio-mastercontainer \
+            --restart always \
+            --publish 80:80 \
+            --publish 8080:8080 \
+            --publish 8443:8443 \
+            --env SKIP_DOMAIN_VALIDATION=true \
+            --volume nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+            --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+            ghcr.io/nextcloud-releases/all-in-one:latest &
+
+      - name: Wait for Nextcloud AIO to start
+        run: |
+          sleep 60  # Ждем, пока контейнеры запустятся
+          sudo docker ps  # Проверяем запущенные контейнеры
+
+      - name: Enable Nextcloud maintenance mode
+        run: |
+          sudo docker exec -u www-data nextcloud-aio-nextcloud php occ maintenance:mode --on || echo "Failed to enable maintenance mode"
+
+      - name: Show Tailscale IP
+        run: |
+          echo "🔗 Tailscale IP:"
+          tailscale ip -4 || echo "Tailscale IP not found"
+
+      - name: Sleep to keep VPS alive
+        run: sleep 21600  # 6 hours
+
+      - name: Backup VPS data and tailscale state
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          # Сохраняем состояние Tailscale
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          # Сохраняем конфигурации frp
+          sudo cp /home/Lilaine/frpc.toml /opt/vps-backup/data/
+          # Сохраняем systemd unit для frpc
+          sudo cp /etc/systemd/system/frpc.service /opt/vps-backup/data/
+          # Сохраняем пользовательские настройки
+          sudo cp /etc/sudoers.d/Lilaine /opt/vps-backup/data/
+          # Сохраняем список установленных пакетов
+          dpkg --get-selections > /opt/vps-backup/data/packages.list
+          # Сохраняем Docker volumes Nextcloud AIO
+          for volume in nextcloud_aio_mastercontainer nextcloud_aio_database nextcloud_aio_nextcloud nextcloud_aio_redis nextcloud_aio_collabora nextcloud_aio_talk; do
+            sudo docker run --rm -v $volume:/data -v /opt/vps-backup:/backup busybox tar cvf /backup/$volume.tar /data
+          done
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Disable Nextcloud maintenance mode
+        run: |
+          sudo docker exec -u www-data nextcloud-aio-nextcloud php occ maintenance:mode --off || echo "Failed to disable maintenance mode"
+
+      - name: Verify backup
+        run: |
+          unzip -l backup.zip
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
